@@ -1,10 +1,12 @@
 [submodule "submodules/diff-gaussian-rasterization"]
 	path = submodules/diff-gaussian-rasterization
-	url = https://github.com/Lab-of-AI-and-Robotics/diff-gaussian-rasterization.git
+	url = git@github.com:Itachi6912110/diff-gaussian-rasterization-gs-icp.git
+	branch = 3dgs-arch-eval
 [submodule "submodules/fast_gicp"]
 	path = submodules/fast_gicp
-	url = https://github.com/Lab-of-AI-and-Robotics/fast_gicp.git
-	branch = gs_icp_slam
+	url = git@github.com:Itachi6912110/fast_gicp.git
+	branch = 3dgs-arch-eval
 [submodule "submodules/simple-knn"]
 	path = submodules/simple-knn
 	url = https://github.com/camenduru/simple-knn.git
+	ignore = untracked
