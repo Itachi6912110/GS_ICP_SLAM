@@ -340,7 +340,7 @@ class Mapper(SLAMParameters):
         cal_lpips = LearnedPerceptualImagePatchSimilarity(net_type='alex', normalize=True).to("cuda")
         original_resolution = True
         image_names, depth_image_names = self.get_image_dirs(self.dataset_path)
-        final_poses = self.final_pose
+        final_poses = np.asarray(self.final_pose.detach().cpu())
         fig, axs = plt.subplots(1, 2, figsize=(10, 5))
         
         with torch.no_grad():

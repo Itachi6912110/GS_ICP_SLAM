@@ -115,7 +115,7 @@ class TrajManager:
     
     def parse_list(self, filepath, skiprows=0):
         data = np.loadtxt(filepath, delimiter=' ',
-                          dtype=np.unicode_, skiprows=skiprows)
+                          dtype=np.str_, skiprows=skiprows)
         return data
     
     def associate_frames(self, tstamp_image, tstamp_depth, tstamp_pose, max_dt=0.08):
