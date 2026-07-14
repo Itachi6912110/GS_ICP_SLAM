@@ -12,6 +12,7 @@ import rerun as rr
 sys.path.append(os.path.dirname(__file__))
 from arguments import SLAMParameters
 from utils.traj_utils import TrajManager
+import arch_stats_utils
 from utils.loss_utils import l1_loss, ssim
 from scene import GaussianModel
 from gaussian_renderer import render, render_3, network_gui
@@ -126,6 +127,34 @@ class Mapper(SLAMParameters):
         while not self.is_tracking_keyframe_shared[0]:
             time.sleep(1e-15)
             
+        self.first_init()
+        
+        while True:
+            if self.end_of_dataset[0]:
+                break
+ 
+            if self.verbose:
+                self.run_viewer()       
+            
+            self.ingest_pending()
+            self.train_step()
+        if self.verbose:
+            while True:
+                self.run_viewer(False)
+        
+        # End of data
+        if self.save_results and not self.rerun_viewer:
+            self.gaussians.save_ply(os.path.join(self.output_path, "scene.ply"))
+        
+        self.calc_2d_metric()
+    
+    # ------------------------------------------------------------------ #
+    # Stepwise pieces of mapping(), also driven directly by the lockstep
+    # single-process runner (gs_icp_slam_st.py). Behavior in the two-process
+    # path is unchanged: mapping() above calls these in the same order.
+    # ------------------------------------------------------------------ #
+    def first_init(self):
+        """Consume the tracker's first keyframe: create the map."""
         self.total_start_time_viewer = time.time()
         
         points, colors, rots, scales, z_values, trackable_filter = self.shared_new_gaussians.get_values()
@@ -149,126 +178,143 @@ class Mapper(SLAMParameters):
         self.mapping_cams.append(newcam)
         self.keyframe_idxs.append(newcam.cam_idx[0])
         self.new_keyframes.append(len(self.mapping_cams)-1)
+        self._new_keyframe_flag = False
+        # arch_stats: before the first tracking-keyframe publish, the GICP
+        # target is the full frame-0 cloud == the initial Gaussians in order
+        # (identity LUT); inview analog is still the trackable subset
+        import torch as _torch
+        self.trackable_snapshot = (
+            self.gaussians.trackable_mask.detach().clone(),
+            arch_stats_utils.scene_version(),
+            _torch.arange(self.gaussians.get_xyz.shape[0],
+                          device=self.gaussians.trackable_mask.device),
+            arch_stats_utils.prune_epoch())
 
-        new_keyframe = False
-        while True:
-            if self.end_of_dataset[0]:
-                break
- 
-            if self.verbose:
-                self.run_viewer()       
+    def ingest_pending(self):
+        """Consume a pending keyframe from the tracker, if any."""
+        if self.is_tracking_keyframe_shared[0]:
+            # get shared gaussians
+            points, colors, rots, scales, z_values, trackable_filter = self.shared_new_gaussians.get_values()
             
-            if self.is_tracking_keyframe_shared[0]:
-                # get shared gaussians
-                points, colors, rots, scales, z_values, trackable_filter = self.shared_new_gaussians.get_values()
-                
-                # Add new gaussians to map gaussians
-                self.gaussians.add_from_pcd2_tensor(points, colors, rots, scales, z_values, trackable_filter)
+            # Add new gaussians to map gaussians
+            self.gaussians.add_from_pcd2_tensor(points, colors, rots, scales, z_values, trackable_filter)
 
-                # Allocate new target points to shared memory
-                target_points, target_rots, target_scales  = self.gaussians.get_trackable_gaussians_tensor(self.trackable_opacity_th)
-                self.shared_target_gaussians.input_values(target_points, target_rots, target_scales)
-                self.target_gaussians_ready[0] = 1
+            # Allocate new target points to shared memory
+            target_points, target_rots, target_scales, target_mask = self.gaussians.get_trackable_gaussians_tensor(self.trackable_opacity_th)
+            self.shared_target_gaussians.input_values(target_points, target_rots, target_scales)
+            self.target_gaussians_ready[0] = 1
+            # arch_stats: snapshot of the published trackable target (global
+            # index space + version), read by the tracker for GICP rows
+            self.trackable_snapshot = (
+                target_mask.detach().clone(),
+                arch_stats_utils.scene_version(),
+                target_mask.nonzero(as_tuple=False).view(-1),
+                arch_stats_utils.prune_epoch())
 
-                # Add new keyframe
-                newcam = copy.deepcopy(self.shared_cam)
-                newcam.on_cuda()
+            # Add new keyframe
+            newcam = copy.deepcopy(self.shared_cam)
+            newcam.on_cuda()
+        
+            self.mapping_cams.append(newcam)
+            self.keyframe_idxs.append(newcam.cam_idx[0])
+            self.new_keyframes.append(len(self.mapping_cams)-1)
+            self.is_tracking_keyframe_shared[0] = 0
+
+        elif self.is_mapping_keyframe_shared[0]:
+            # get shared gaussians
+            points, colors, rots, scales, z_values, _ = self.shared_new_gaussians.get_values()
             
-                self.mapping_cams.append(newcam)
-                self.keyframe_idxs.append(newcam.cam_idx[0])
-                self.new_keyframes.append(len(self.mapping_cams)-1)
-                self.is_tracking_keyframe_shared[0] = 0
+            # Add new gaussians to map gaussians
+            self.gaussians.add_from_pcd2_tensor(points, colors, rots, scales, z_values, [])
+            
+            # Add new keyframe
+            newcam = copy.deepcopy(self.shared_cam)
+            newcam.on_cuda()
+            self.mapping_cams.append(newcam)
+            self.keyframe_idxs.append(newcam.cam_idx[0])
+            self.new_keyframes.append(len(self.mapping_cams)-1)
+            self.is_mapping_keyframe_shared[0] = 0
 
-            elif self.is_mapping_keyframe_shared[0]:
-                # get shared gaussians
-                points, colors, rots, scales, z_values, _ = self.shared_new_gaussians.get_values()
-                
-                # Add new gaussians to map gaussians
-                self.gaussians.add_from_pcd2_tensor(points, colors, rots, scales, z_values, [])
-                
-                # Add new keyframe
-                newcam = copy.deepcopy(self.shared_cam)
-                newcam.on_cuda()
-                self.mapping_cams.append(newcam)
-                self.keyframe_idxs.append(newcam.cam_idx[0])
-                self.new_keyframes.append(len(self.mapping_cams)-1)
-                self.is_mapping_keyframe_shared[0] = 0
+    def train_step(self):
+        """One mapping optimization iteration (render + backward + step)."""
+        if len(self.mapping_cams) == 0:
+            return
+        new_keyframe = getattr(self, "_new_keyframe_flag", False)
+        # train once on new keyframe, and random
+        if len(self.new_keyframes) > 0:
+            train_idx = self.new_keyframes.pop(0)
+            viewpoint_cam = self.mapping_cams[train_idx]
+            new_keyframe = True
+        else:
+            train_idx = random.choice(range(len(self.mapping_cams)))
+            viewpoint_cam = self.mapping_cams[train_idx]
         
-            if len(self.mapping_cams)>0:
-                
-                # train once on new keyframe, and random
-                if len(self.new_keyframes) > 0:
-                    train_idx = self.new_keyframes.pop(0)
-                    viewpoint_cam = self.mapping_cams[train_idx]
-                    new_keyframe = True
-                else:
-                    train_idx = random.choice(range(len(self.mapping_cams)))
-                    viewpoint_cam = self.mapping_cams[train_idx]
-                
-                if self.training_stage==0:
-                    gt_image = viewpoint_cam.original_image.cuda()
-                    gt_depth_image = viewpoint_cam.original_depth_image.cuda()
-                elif self.training_stage==1:
-                    gt_image = viewpoint_cam.rgb_level_1.cuda()
-                    gt_depth_image = viewpoint_cam.depth_level_1.cuda()
-                elif self.training_stage==2:
-                    gt_image = viewpoint_cam.rgb_level_2.cuda()
-                    gt_depth_image = viewpoint_cam.depth_level_2.cuda()
-                
-                self.training=True
-                render_pkg = render_3(viewpoint_cam, self.gaussians, self.pipe, self.background, training_stage=self.training_stage)
-                
-                depth_image = render_pkg["render_depth"]
-                image = render_pkg["render"]
-                viewspace_point_tensor, visibility_filter, radii = render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-                
-                mask = (gt_depth_image>0.)
-                mask = mask.detach()
-                # color_mask = torch.tile(mask, (3,1,1))
-                gt_image = gt_image * mask
-                
-                # Loss
-                Ll1_map, Ll1 = l1_loss(image, gt_image)
-                L_ssim_map, L_ssim = ssim(image, gt_image)
-
-                d_max = 10.
-                Ll1_d_map, Ll1_d = l1_loss(depth_image/d_max, gt_depth_image/d_max)
-
-                loss_rgb = (1.0 - self.lambda_dssim) * Ll1 + self.lambda_dssim * (1.0 - L_ssim)
-                loss_d = Ll1_d
-                
-                loss = loss_rgb + 0.1*loss_d
-                
-                loss.backward()
-                with torch.no_grad():
-                    if self.train_iter % 200 == 0:  # 200
-                        self.gaussians.prune_large_and_transparent(0.005, self.prune_th)
-                    
-                    self.gaussians.optimizer.step()
-                    self.gaussians.optimizer.zero_grad(set_to_none = True)
-                    
-                    if new_keyframe and self.rerun_viewer:
-                        current_i = copy.deepcopy(self.iter_shared[0])
-                        rgb_np = image.cpu().numpy().transpose(1,2,0)
-                        rgb_np = np.clip(rgb_np, 0., 1.0) * 255
-                        # rr.set_time_sequence("step", current_i)
-                        rr.set_time_seconds("log_time", time.time() - self.total_start_time_viewer)
-                        rr.log("rendered_rgb", rr.Image(rgb_np))
-                        new_keyframe = False
-                        
-                self.training = False
-                self.train_iter += 1
-                # torch.cuda.empty_cache()
-        if self.verbose:
-            while True:
-                self.run_viewer(False)
+        if self.training_stage==0:
+            gt_image = viewpoint_cam.original_image.cuda()
+            gt_depth_image = viewpoint_cam.original_depth_image.cuda()
+        elif self.training_stage==1:
+            gt_image = viewpoint_cam.rgb_level_1.cuda()
+            gt_depth_image = viewpoint_cam.depth_level_1.cuda()
+        elif self.training_stage==2:
+            gt_image = viewpoint_cam.rgb_level_2.cuda()
+            gt_depth_image = viewpoint_cam.depth_level_2.cuda()
         
-        # End of data
+        self.training=True
+        render_pkg = render_3(viewpoint_cam, self.gaussians, self.pipe, self.background, training_stage=self.training_stage)
+        arch_stats_utils.record(render_pkg, "mapping", int(self.iter_shared[0]),
+                                view_id=int(self.keyframe_idxs[train_idx]),
+                                itr=self.train_iter, model=self.gaussians,
+                                camera=viewpoint_cam,
+                                extra={"new_keyframe": bool(new_keyframe)})
+        
+        depth_image = render_pkg["render_depth"]
+        image = render_pkg["render"]
+        viewspace_point_tensor, visibility_filter, radii = render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        
+        mask = (gt_depth_image>0.)
+        mask = mask.detach()
+        gt_image = gt_image * mask
+        
+        # Loss
+        Ll1_map, Ll1 = l1_loss(image, gt_image)
+        L_ssim_map, L_ssim = ssim(image, gt_image)
+
+        d_max = 10.
+        Ll1_d_map, Ll1_d = l1_loss(depth_image/d_max, gt_depth_image/d_max)
+
+        loss_rgb = (1.0 - self.lambda_dssim) * Ll1 + self.lambda_dssim * (1.0 - L_ssim)
+        loss_d = Ll1_d
+        
+        loss = loss_rgb + 0.1*loss_d
+        
+        loss.backward()
+        with torch.no_grad():
+            if self.train_iter % 200 == 0:  # 200
+                self.gaussians.prune_large_and_transparent(0.005, self.prune_th)
+            
+            self.gaussians.optimizer.step()
+            self.gaussians.optimizer.zero_grad(set_to_none = True)
+            arch_stats_utils.notify_param_change("map_opt_step")
+            
+            if new_keyframe and self.rerun_viewer:
+                current_i = copy.deepcopy(self.iter_shared[0])
+                rgb_np = image.cpu().numpy().transpose(1,2,0)
+                rgb_np = np.clip(rgb_np, 0., 1.0) * 255
+                # rr.set_time_sequence("step", current_i)
+                rr.set_time_seconds("log_time", time.time() - self.total_start_time_viewer)
+                rr.log("rendered_rgb", rr.Image(rgb_np))
+                new_keyframe = False
+                
+        self.training = False
+        self.train_iter += 1
+        self._new_keyframe_flag = False
+
+    def finalize(self):
+        """End-of-run outputs (mirrors the tail of mapping())."""
         if self.save_results and not self.rerun_viewer:
             self.gaussians.save_ply(os.path.join(self.output_path, "scene.ply"))
-        
         self.calc_2d_metric()
-    
+
     def run_viewer(self, lower_speed=True):
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -379,7 +425,10 @@ class Mapper(SLAMParameters):
                 
                 cam.update_matrix()
                 # rendered rgb
-                ours_rgb_ = render(cam, self.gaussians, self.pipe, self.background)["render"]
+                eval_pkg = render(cam, self.gaussians, self.pipe, self.background)
+                arch_stats_utils.record(eval_pkg, "eval", i, itr=0,
+                                        model=self.gaussians, camera=cam)
+                ours_rgb_ = eval_pkg["render"]
                 ours_rgb_ = torch.clamp(ours_rgb_, 0., 1.).cuda()
                 
                 valid_depth_mask_ = (gt_depth_>0)

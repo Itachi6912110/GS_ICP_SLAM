@@ -11,6 +11,7 @@
 
 import torch
 import math
+import diff_gaussian_rasterization as dgr
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
@@ -103,13 +104,17 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     # print(depth_image.shape, rendered_image.shape)
-    return {"render": rendered_image,
+    render_pkg = {"render": rendered_image,
             "render_depth": depth_image,
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii,
             "is_used": is_used,
             }
+    stats = dgr.get_last_stats()
+    if stats is not None:
+        render_pkg.update(stats)
+    return render_pkg
 
 def render_2(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, 
            training_stage=0):
@@ -207,13 +212,17 @@ def render_2(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     # print(depth_image.shape, rendered_image.shape)
-    return {"render": rendered_image,
+    render_pkg = {"render": rendered_image,
             "render_depth": depth_image,
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii,
             "is_used": is_used,
             }
+    stats = dgr.get_last_stats()
+    if stats is not None:
+        render_pkg.update(stats)
+    return render_pkg
 
 def render_3(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, 
            training_stage=0):
@@ -311,10 +320,14 @@ def render_3(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     # print(depth_image.shape, rendered_image.shape)
-    return {"render": rendered_image,
+    render_pkg = {"render": rendered_image,
             "render_depth": depth_image,
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii,
             "is_used": is_used,
             }
+    stats = dgr.get_last_stats()
+    if stats is not None:
+        render_pkg.update(stats)
+    return render_pkg

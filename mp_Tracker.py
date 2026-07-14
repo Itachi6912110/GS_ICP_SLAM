@@ -15,6 +15,9 @@ sys.path.append(os.path.dirname(__file__))
 from arguments import SLAMParameters
 from utils.traj_utils import TrajManager
 from gaussian_renderer import render, render_2, network_gui
+from scene.shared_objs import getWorld2View2
+import arch_stats_utils
+from types import SimpleNamespace
 from tqdm import tqdm
 
 
@@ -93,6 +96,11 @@ class Tracker(SLAMParameters):
         self.final_pose = slam.final_pose
         self.demo = slam.demo
         self.is_mapping_process_started = slam.is_mapping_process_started
+        # lockstep single-process mode (gs_icp_slam_st.py): the Mapper is
+        # driven synchronously from this loop instead of a second process
+        self.sync_mapper = None
+        self.mapping_iters_per_frame = int(getattr(slam, "mapping_iters_per_frame", 5))
+        self.frame_limit = getattr(slam, "frame_limit", None)
     
     def run(self):
         self.tracking()
@@ -106,6 +114,10 @@ class Tracker(SLAMParameters):
         
         self.rgb_images, self.depth_images = self.get_images(f"{self.dataset_path}/images")
         self.num_images = len(self.rgb_images)
+        if self.frame_limit:  # dev-only cap (arch_stats iteration)
+            self.num_images = min(self.num_images, int(self.frame_limit))
+            self.rgb_images = self.rgb_images[:self.num_images]
+            self.depth_images = self.depth_images[:self.num_images]
         self.reg.set_max_correspondence_distance(self.max_correspondence_distance)
         self.reg.set_max_knn_distance(self.knn_max_distance)
         if_mapping_keyframe = False
@@ -179,6 +191,8 @@ class Tracker(SLAMParameters):
                 self.shared_cam.cam_idx[0] = self.iteration_images
                 
                 self.is_tracking_keyframe_shared[0] = 1
+                if self.sync_mapper is not None:
+                    self.sync_mapper.first_init()
                 
                 while self.demo[0]:
                     time.sleep(1e-15)
@@ -229,6 +243,7 @@ class Tracker(SLAMParameters):
                 points = np.matmul(R, points.transpose()).transpose() - np.matmul(R, T)
                 # Use only trackable points when tracking
                 target_corres, distances = self.reg.get_source_correspondence() # get associated points source points
+                self._record_tracking_stats(target_corres, distances, R, T)
                 
                 # Keyframe selection #
                 # Tracking keyframe
@@ -279,6 +294,8 @@ class Tracker(SLAMParameters):
                     self.shared_cam.cam_idx[0] = self.iteration_images
                     
                     self.is_tracking_keyframe_shared[0] = 1
+                    if self.sync_mapper is not None:
+                        self.sync_mapper.ingest_pending()
                     
                     # Get new target point
                     while not self.target_gaussians_ready[0]:
@@ -318,22 +335,83 @@ class Tracker(SLAMParameters):
                     self.shared_cam.cam_idx[0] = self.iteration_images
                     
                     self.is_mapping_keyframe_shared[0] = 1
+                    if self.sync_mapper is not None:
+                        self.sync_mapper.ingest_pending()
             pbar.update(1)
             
-            while 1/((time.time() - self.total_start_time)/(self.iteration_images+1)) > 30.:    #30. float(self.test)
-                time.sleep(1e-15)
+            if self.sync_mapper is not None:
+                # lockstep: a fixed mapping budget per tracked frame replaces
+                # the wall-clock 30FPS pacing of the two-process mode
+                self.sync_mapper.ingest_pending()
+                for _ in range(self.mapping_iters_per_frame):
+                    self.sync_mapper.train_step()
+            else:
+                while 1/((time.time() - self.total_start_time)/(self.iteration_images+1)) > 30.:    #30. float(self.test)
+                    time.sleep(1e-15)
                 
             self.iteration_images += 1
         
         # Tracking end
         pbar.close()
-        self.final_pose[:,:,:] = torch.tensor(self.poses).float()
+        self.final_pose[:len(self.poses)] = torch.tensor(np.array(self.poses)).float()
         self.end_of_dataset[0] = 1
         
         print(f"System FPS: {1/((time.time()-self.total_start_time)/self.num_images):.2f}")
-        print(f"ATE RMSE: {self.evaluate_ate(self.trajmanager.gt_poses, self.poses)*100.:.2f}")
+        print(f"ATE RMSE: {self.evaluate_ate(self.trajmanager.gt_poses[:len(self.poses)], self.poses)*100.:.2f}")
 
     
+    def _record_tracking_stats(self, target_corres, distances, R, T):
+        """Render-less per-frame GICP row: what tracking actually touched.
+
+        inview analog = the trackable target subset published by the mapper;
+        contrib analog = unique matched target Gaussians of this frame
+        (correspondences within max_correspondence_distance). Masks live in
+        the publish snapshot's index space/version."""
+        if self.sync_mapper is None or not arch_stats_utils.enabled():
+            return
+        snap = getattr(self.sync_mapper, "trackable_snapshot", None)
+        if snap is None:
+            return
+        t_mask, t_version, global_idx, t_epoch = snap
+        n_target = int(global_idx.shape[0])
+        corres = np.asarray(target_corres)
+        dist = np.asarray(distances)
+        sel = np.unique(corres[dist < self.max_correspondence_distance])
+        sel = sel[(sel >= 0) & (sel < n_target)]
+        matched = torch.zeros_like(t_mask)
+        if sel.shape[0] > 0:
+            sel_t = torch.from_numpy(sel.astype(np.int64)).to(global_idx.device)
+            matched[global_idx[sel_t]] = True
+        matched &= t_mask  # count only matched *trackable* Gaussians
+        # appends keep indices stable: if no prune since publish, pad the
+        # masks to the live model so overlap + BVH-ancestor stats apply
+        masks_are_live = (t_epoch == arch_stats_utils.prune_epoch())
+        n_total_row = int(t_mask.shape[0])
+        if masks_are_live:
+            P_live = int(self.sync_mapper.gaussians.get_xyz.shape[0])
+            if P_live > t_mask.shape[0]:
+                pad = torch.zeros(P_live - t_mask.shape[0],
+                                  dtype=torch.bool, device=t_mask.device)
+                t_mask = torch.cat([t_mask, pad])
+                matched = torch.cat([matched, pad])
+            n_total_row = P_live
+        # camera at the current tracked pose (for the BVH frustum query)
+        wv = getWorld2View2(torch.from_numpy(np.asarray(R, dtype=np.float32)),
+                            torch.from_numpy(np.asarray(T, dtype=np.float32)),
+                            self.shared_cam.trans,
+                            self.shared_cam.scale).transpose(0, 1)
+        cam = SimpleNamespace(
+            full_proj_transform=wv @ self.shared_cam.projection_matrix)
+        arch_stats_utils.record_tracking(
+            frame_id=int(self.iter_shared[0]),
+            trackable_mask=t_mask, matched_mask=matched,
+            snapshot_version=t_version, n_total=n_total_row,
+            model=self.sync_mapper.gaussians, camera=cam,
+            extra={"gicp_n_source_corres": int(dist.shape[0]),
+                   "gicp_n_matched_raw": int(sel.shape[0]),
+                   "gicp_n_target": n_target},
+            masks_are_live=masks_are_live)
+
     def get_images(self, images_folder):
         rgb_images = []
         depth_images = []

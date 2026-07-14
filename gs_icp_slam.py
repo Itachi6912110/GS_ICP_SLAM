@@ -44,6 +44,10 @@ class GS_ICP_SLAM(SLAMParameters):
         self.test = args.test
         self.save_results = args.save_results
         self.rerun_viewer = args.rerun_viewer
+        # gs_stats (used by the lockstep runner gs_icp_slam_st.py)
+        self.arch_stats = getattr(args, "arch_stats", False)
+        self.mapping_iters_per_frame = int(getattr(args, "mapping_iters_per_frame", 5))
+        self.frame_limit = getattr(args, "frame_limit", None)
         
         if self.rerun_viewer:
             rr.init("3dgsviewer")
@@ -244,6 +248,10 @@ if __name__ == "__main__":
     parser.add_argument("--test", default=None)
     parser.add_argument("--save_results", action='store_true', default=None)
     parser.add_argument("--rerun_viewer", action="store_true", default=False)
+    parser.add_argument("--arch_stats", action="store_true", default=False,
+                        help="gs_stats workload probing (use gs_icp_slam_st.py)")
+    parser.add_argument("--mapping_iters_per_frame", default=5,
+                        help="lockstep mapping budget per frame (st runner)")
     args = parser.parse_args()
 
     gs_icp_slam = GS_ICP_SLAM(args)

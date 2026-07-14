@@ -17,6 +17,7 @@ import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
+import arch_stats_utils
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
@@ -161,6 +162,7 @@ class GaussianModel(nn.Module):
         self.keyframe_idx = torch.ones((self.get_xyz.shape[0],1), dtype=torch.bool, device="cuda")
         
         torch.cuda.empty_cache()
+        arch_stats_utils.notify_scene_change("create")
     
     def add_from_pcd2_tensor(self, points, colors, rots_, scales_, z_vals_, trackable_idxs):
         # Add new gaussians to the whole gaussian map
@@ -212,7 +214,8 @@ class GaussianModel(nn.Module):
             target_rots = self.get_rotation[target_idxs]
             target_scales = self.get_scaling[target_idxs]
             
-            return target_points.cpu(), target_rots.cpu(), target_scales.cpu()
+            return (target_points.cpu(), target_rots.cpu(),
+                    target_scales.cpu(), target_idxs)
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -440,6 +443,7 @@ class GaussianModel(nn.Module):
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.trackable_mask = self.trackable_mask[valid_points_mask]
+        arch_stats_utils.notify_scene_change("prune")
         
         try:
             self.keyframe_idx = self.keyframe_idx[valid_points_mask]
@@ -490,6 +494,7 @@ class GaussianModel(nn.Module):
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         
         self.trackable_mask = torch.concat([self.trackable_mask, new_trackable_mask], dim=0)
+        arch_stats_utils.notify_scene_change("add")
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         #torch.cuda.empty_cache()
